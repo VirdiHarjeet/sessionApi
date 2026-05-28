@@ -1,27 +1,33 @@
 import Foundation
-import UIKit
 
-struct ApiManager {
-    // MARK: Normal API
-    static func upload<T: Decodable>(
-        _ type: T.Type,
-        requestProtocol: RequestProtocol
-    ) async throws -> T {
-        guard let request = getRequest(requestProtocol: requestProtocol) else {
+struct ApiManager: ApiProvider {
+    func request<T: Decodable>(_ type: T.Type, request: RequestProtocol) async throws -> T {
+        
+        guard let urlRequest = try createRequest(requestProtocol: request) else {
             throw CustomError.invalidRequest
         }
         
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        
+        do {
+            (data, response) = try await URLSession.shared.data(for: urlRequest)
+        } catch {
+            throw CustomError.networkError(error)
+        }
         
         guard let httpResponse = response as? HTTPURLResponse else {
             throw CustomError.invalidResponse
         }
         
-//        if httpResponse.statusCode == 401 {
- //            try await refreshToken()
-//            // retry request once after refresh
-//            return try await upload(type, requestProtocol: requestProtocol)
-//        }
+        switch httpResponse.statusCode {
+        case 200...299:
+            break
+        case 401:
+            throw CustomError.unauthorized
+        default:
+            throw CustomError.serverError(httpResponse.statusCode)
+        }
         
         do {
             return try JSONDecoder().decode(T.self, from: data)
@@ -29,181 +35,86 @@ struct ApiManager {
             throw CustomError.decodingError(error)
         }
     }
-    
-    // MARK: Multipart API
-    static func uploadMultipart<T: Decodable>(
-        _ type: T.Type,
-        requestProtocol: RequestProtocol,
-        media: [Media]?
-    ) async throws -> T {
-        guard let request = getMultipartRequest(media: media, requestProtocol: requestProtocol) else {
-            throw CustomError.invalidRequest
+
+    private func createRequest(requestProtocol: RequestProtocol) throws -> URLRequest? {
+        guard let url = URL(string: requestProtocol.path) else {
+            return nil
         }
-        let (data, _) = try await URLSession.shared.data(for: request)
-        do {
-            return try JSONDecoder().decode(T.self, from: data)
-        } catch {
-            throw CustomError.decodingError(error)
-        }
-    }
-    
-    // MARK: Create Normal Request
-    private static func getRequest(requestProtocol: RequestProtocol) -> URLRequest? {
-        guard let url = URL(string: requestProtocol.path) else { return nil }
         
         var request = URLRequest(url: url)
         request.httpMethod = requestProtocol.method.rawValue
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.addValue(getTimeZone(), forHTTPHeaderField: "timezone")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        if let headers = requestProtocol.headers {
+            for (key, value) in headers {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+        }
         
         if let param = requestProtocol.param {
-            request.httpBody = try? JSONSerialization.data(withJSONObject: param, options: .fragmentsAllowed)
-        }
-        
-        if let header = requestProtocol.header {
-            for (key, value) in header {
-                request.addValue(value, forHTTPHeaderField: key)
+            do {
+                request.httpBody = try JSONSerialization.data(withJSONObject: param, options: .fragmentsAllowed)
+            } catch {
+                throw CustomError.invalidRequest
             }
         }
+        
         return request
     }
-    
-    // MARK: Create Multipart Request
-    private static func getMultipartRequest(media: [Media]?, requestProtocol: RequestProtocol) -> URLRequest? {
-        let boundary = getBoundary()
-        guard let url = URL(string: requestProtocol.path) else { return nil }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = requestProtocol.method.rawValue
-        let lineBreak = "\r\n"
-        var body = Data()
-        
-        if let parameters = requestProtocol.param {
-            for (key, value) in parameters {
-                body.append("--\(boundary + lineBreak)")
-                body.append("Content-Disposition: form-data; name=\"\(key)\"\(lineBreak + lineBreak)")
-                body.append("\(value)\(lineBreak)")
-            }
-        }
-        
-        if let media = media {
-            for photo in media {
-                body.append("--\(boundary + lineBreak)")
-                body.append("Content-Disposition: form-data; name=\"\(photo.key)\"; filename=\"\(photo.fileName)\"\(lineBreak)")
-                body.append("Content-Type: \(photo.mimeType + lineBreak + lineBreak)")
-                body.append(photo.data)
-                body.append(lineBreak)
-            }
-        }
-        
-        request.allHTTPHeaderFields = [
-            "X-User-Agent": "ios",
-            "Accept-Language": "en",
-            "Accept": "application/json",
-            "Content-Type": "multipart/form-data; boundary=\(boundary)",
-        ]
-        
-        if let header = requestProtocol.header {
-            for (key, value) in header {
-                request.addValue(value, forHTTPHeaderField: key)
-            }
-        }
-        
-        body.append("--\(boundary)--\(lineBreak)")
-        request.httpBody = body
-        return request
-    }
-    
-    // MARK: Helpers
-    static func getBoundary() -> String {
-        "Boundary-\(UUID().uuidString)"
-    }
-    
-    static func getTimeZone() -> String {
-        TimeZone.current.identifier
-    }
 }
 
-
-// MARK: Media Multipart Api
-struct Media{
-    let key: String
-    let mimeType: String
-    let data: Data
-    let fileName: String
-    init?(forKey key: String, withImage image: UIImage = UIImage(), withMime mimeType:String, withVideo videoData:Data = Data()) {
-        self.key = key
-        self.mimeType = mimeType
-        if let data = image.jpegData(compressionQuality: 0.5){
-            self.data = data
-            self.fileName = "\(arc4random()).jpeg"
-        }else{
-            self.data = videoData
-            self.fileName = "\(arc4random()).mp4"
-        }
-    }
+protocol ApiProvider {
+    func request<T: Decodable>(
+        _ type: T.Type,
+        request: RequestProtocol
+    ) async throws -> T
 }
 
-// MARK:  Convert string to Data
-extension Data {
-    mutating func append(_ string: String) {
-        if let data = string.data(using: .utf8) {
-            append(data)
-        }
-    }
-}
-
-
-// Mark:- Request Protocol
-protocol RequestProtocol{
+protocol RequestProtocol {
     var path: String { get }
     var method: HTTPMethod { get }
-    var header: [String:String]? { get }
-    var param: [String:Any]? { get }
+    var headers: [String: String]? { get }
+    var param: [String: Any]? { get }
 }
 
-extension RequestProtocol{
-    var header: [String:String]? {
+extension RequestProtocol {
+    var headers: [String: String]? {
         return nil
     }
-    
-    var param: [String:Any]? {
+    var param: [String: Any]? {
         return nil
     }
 }
 
-  // Mark:- HTTP Method
 enum HTTPMethod: String {
     case get = "GET"
     case post = "POST"
-    case patch = "PATCH"
-    case delete = "DELETE"
     case put = "PUT"
+    case delete = "DELETE"
 }
-enum otpCase{
-    case signup
- 
-    case login
-}
-enum CustomError: Error {
+
+enum CustomError: LocalizedError {
     case invalidRequest
-    case apiError(Error)
-    case decodingError(Error)
     case invalidResponse
-}
+    case unauthorized
+    case serverError(Int)
+    case decodingError(Error)
+    case networkError(Error)
 
-
-// USE
- do {
-            let user = try await ApiManager.upload(AuthModal.self, requestProtocol: request)
-            appState.hideLoader()
-            print(user)
-            if user.status == true {
-                register = true
-            } else {
-                appState.showAlert(title: Constants.Alert.error, message: user.message ?? "Login failed")
-            }
-        } catch {
-            appState.hideLoader()
-            appState.showAlert(title: Constants.Alert.error, message: error.localizedDescription)
+    var errorDescription: String? {
+        switch self {
+        case .invalidRequest:
+            return "Invalid Request"
+        case .invalidResponse:
+            return "Invalid Response"
+        case .unauthorized:
+            return "Unauthorized"
+        case .serverError(let code):
+            return "Server Error: \(code)"
+        case .decodingError(let error):
+            return "Decoding Error: \(error.localizedDescription)"
+        case .networkError(let error):
+            return "Network Error: \(error.localizedDescription)"
         }
+    }
+}
